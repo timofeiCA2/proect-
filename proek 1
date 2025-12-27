@@ -1,0 +1,557 @@
+"""
+Утилита для массового пинга хостов
+"""
+
+import asyncio
+import sys
+import json
+import csv
+from datetime import datetime
+from typing import List, Dict, Optional
+import argparse
+import statistics
+import socket
+import os
+
+
+class PingResult:
+    """Класс для хранения результатов пинга одного хоста"""
+    
+    def __init__(self, host: str):
+        self.host = host
+        self.success = False
+        self.response_times: List[float] = []
+        self.packets_sent = 0
+        self.packets_received = 0
+        self.error_message: Optional[str] = None
+    
+    def add_response(self, response_time: float):
+        """Добавить успешный ответ"""
+        self.response_times.append(response_time)
+        self.packets_sent += 1
+        self.packets_received += 1
+        self.success = True
+    
+    def add_timeout(self):
+        """Добавить таймаут"""
+        self.packets_sent += 1
+        self.success = False
+    
+    def add_error(self, error: str):
+        """Добавить ошибку"""
+        self.error_message = error
+        self.success = False
+    
+    def get_stats(self) -> Dict:
+        """Получить статистику для хоста"""
+        if not self.response_times:
+            return {
+                'host': self.host,
+                'status': 'unreachable',
+                'packet_loss': 100.0 if self.packets_sent > 0 else 0.0,
+                'avg_time': None,
+                'min_time': None,
+                'max_time': None,
+                'std_dev': None,
+                'error': self.error_message
+            }
+        
+        return {
+            'host': self.host,
+            'status': 'reachable',
+            'packet_loss': ((self.packets_sent - self.packets_received) / self.packets_sent) * 100,
+            'avg_time': statistics.mean(self.response_times),
+            'min_time': min(self.response_times),
+            'max_time': max(self.response_times),
+            'std_dev': statistics.stdev(self.response_times) if len(self.response_times) > 1 else 0,
+            'packets_sent': self.packets_sent,
+            'packets_received': self.packets_received
+        }
+
+
+class MassPing:
+    """Основной класс для массового пинга"""
+    
+    def __init__(self, timeout: float = 2.0, count: int = 3, concurrent_limit: int = 50):
+        """
+        Инициализация утилиты
+        
+        Args:
+            timeout: Таймаут для каждого пинга в секундах
+            count: Количество пакетов для каждого хоста
+            concurrent_limit: Максимальное количество одновременных пингов
+        """
+        self.timeout = timeout
+        self.count = count
+        self.concurrent_limit = concurrent_limit
+        self.results: Dict[str, PingResult] = {}
+        self.semaphore = asyncio.Semaphore(concurrent_limit)
+    
+    async def ping_host(self, host: str) -> PingResult:
+        """
+        Пинг одного хоста с указанным количеством пакетов
+        
+        Args:
+            host: Имя хоста или IP-адрес
+            
+        Returns:
+            PingResult: Результаты пинга
+        """
+        result = PingResult(host)
+        
+        for i in range(self.count):
+            async with self.semaphore:
+                try:
+                    # Создаем подключение
+                    start_time = asyncio.get_event_loop().time()
+                    
+                    # Пробуем разные порты для проверки доступности
+                    ports_to_try = [80, 443, 22, 53]  # HTTP, HTTPS, SSH, DNS
+                    
+                    for port in ports_to_try:
+                        try:
+                            reader, writer = await asyncio.wait_for(
+                                asyncio.open_connection(host, port),
+                                timeout=self.timeout
+                            )
+                            writer.close()
+                            await writer.wait_closed()
+                            
+                            response_time = (asyncio.get_event_loop().time() - start_time) * 1000  # в мс
+                            result.add_response(response_time)
+                            break  # Успешно подключились, выходим из цикла по портам
+                            
+                        except (ConnectionRefusedError, TimeoutError):
+                            # Пробуем следующий порт
+                            continue
+                            
+                    else:
+                        # Если ни один порт не ответил
+                        result.add_timeout()
+                    
+                except asyncio.TimeoutError:
+                    result.add_timeout()
+                    
+                except Exception as e:
+                    result.add_error(str(e))
+        
+        return result
+    
+    async def ping_hosts(self, hosts: List[str]) -> Dict[str, PingResult]:
+        """
+        Пинг нескольких хостов одновременно
+        
+        Args:
+            hosts: Список хостов для пинга
+            
+        Returns:
+            Dict[str, PingResult]: Словарь с результатами
+        """
+        tasks = []
+        for host in hosts:
+            tasks.append(self.ping_host(host))
+        
+        results_list = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Обрабатываем результаты
+        for i, result in enumerate(results_list):
+            if isinstance(result, Exception):
+                # Если произошла ошибка, создаем результат с ошибкой
+                host = hosts[i]
+                error_result = PingResult(host)
+                error_result.add_error(str(result))
+                self.results[host] = error_result
+            else:
+                self.results[result.host] = result
+        
+        return self.results
+    
+    def print_summary(self):
+        """Вывод сводной статистики"""
+        print("\n" + "="*80)
+        print("СВОДНАЯ СТАТИСТИКА ПИНГА")
+        print("="*80)
+        
+        total_hosts = len(self.results)
+        reachable_hosts = sum(1 for r in self.results.values() if r.success)
+        
+        print(f"Всего хостов: {total_hosts}")
+        print(f"Доступно: {reachable_hosts}")
+        print(f"Недоступно: {total_hosts - reachable_hosts}")
+        print(f"Процент доступности: {(reachable_hosts/total_hosts*100):.1f}%")
+        
+        # Статистика по времени отклика
+        all_times = []
+        for result in self.results.values():
+            if result.response_times:
+                all_times.extend(result.response_times)
+        
+        if all_times:
+            print(f"\nСтатистика времени отклика (мс):")
+            print(f"  Среднее: {statistics.mean(all_times):.2f}")
+            print(f"  Медиана: {statistics.median(all_times):.2f}")
+            print(f"  Минимум: {min(all_times):.2f}")
+            print(f"  Максимум: {max(all_times):.2f}")
+            if len(all_times) > 1:
+                print(f"  Стандартное отклонение: {statistics.stdev(all_times):.2f}")
+        
+        print("="*80)
+    
+    def print_detailed_results(self):
+        """Вывод подробных результатов по каждому хосту"""
+        print("\n" + "="*80)
+        print("ПОДРОБНЫЕ РЕЗУЛЬТАТЫ")
+        print("="*80)
+        
+        for host, result in self.results.items():
+            stats = result.get_stats()
+            status_icon = "✓" if stats['status'] == 'reachable' else "✗"
+            
+            print(f"\n{status_icon} {host}")
+            print(f"  Статус: {'ДОСТУПЕН' if stats['status'] == 'reachable' else 'НЕДОСТУПЕН'}")
+            
+            if stats['status'] == 'reachable':
+                print(f"  Потеря пакетов: {stats['packet_loss']:.1f}%")
+                print(f"  Среднее время: {stats['avg_time']:.2f} мс")
+                print(f"  Минимальное: {stats['min_time']:.2f} мс")
+                print(f"  Максимальное: {stats['max_time']:.2f} мс")
+                print(f"  Отправлено/Получено: {stats['packets_sent']}/{stats['packets_received']}")
+            elif stats['error']:
+                print(f"  Ошибка: {stats['error']}")
+    
+    def export_json(self, filename: str):
+        """Экспорт результатов в JSON"""
+        export_data = {
+            'timestamp': datetime.now().isoformat(),
+            'config': {
+                'timeout': self.timeout,
+                'count': self.count,
+                'concurrent_limit': self.concurrent_limit
+            },
+            'results': {host: result.get_stats() for host, result in self.results.items()}
+        }
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(export_data, f, indent=2, ensure_ascii=False)
+        
+        print(f"\nРезультаты экспортированы в {filename}")
+    
+    def export_csv(self, filename: str):
+        """Экспорт результатов в CSV"""
+        with open(filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            # Заголовок
+            writer.writerow(['host', 'status', 'packet_loss', 'avg_time', 
+                           'min_time', 'max_time', 'std_dev', 'packets_sent', 
+                           'packets_received', 'error'])
+            
+            # Данные
+            for result in self.results.values():
+                stats = result.get_stats()
+                writer.writerow([
+                    stats['host'],
+                    stats['status'],
+                    f"{stats['packet_loss']:.1f}" if stats['packet_loss'] is not None else '',
+                    f"{stats['avg_time']:.2f}" if stats['avg_time'] is not None else '',
+                    f"{stats['min_time']:.2f}" if stats['min_time'] is not None else '',
+                    f"{stats['max_time']:.2f}" if stats['max_time'] is not None else '',
+                    f"{stats['std_dev']:.2f}" if stats['std_dev'] is not None else '',
+                    stats.get('packets_sent', ''),
+                    stats.get('packets_received', ''),
+                    stats['error'] or ''
+                ])
+        
+        print(f"\nРезультаты экспортированы в {filename}")
+
+
+def read_hosts_from_file(filename: str) -> List[str]:
+    """
+    Чтение списка хостов из файла
+    
+    Args:
+        filename: Имя файла
+        
+    Returns:
+        List[str]: Список хостов
+    """
+    hosts = []
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    hosts.append(line)
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {filename} не найден")
+        return []
+    except Exception as e:
+        print(f"Ошибка при чтении файла: {e}")
+        return []
+    
+    return hosts
+
+
+def read_hosts_from_input() -> List[str]:
+    """
+    Чтение списка хостов из пользовательского ввода
+    
+    Returns:
+        List[str]: Список хостов
+    """
+    print("\n" + "="*50)
+    print("ВВОД СПИСКА ХОСТОВ")
+    print("="*50)
+    print("Введите хосты для проверки (один на строку).")
+    print("Для завершения ввода введите пустую строку.")
+    print("Пример:")
+    print("  google.com")
+    print("  8.8.8.8")
+    print("  yandex.ru")
+    print("  (пустая строка для завершения)")
+    print("="*50)
+    
+    hosts = []
+    while True:
+        try:
+            line = input(f"Хост {len(hosts) + 1}: ").strip()
+            if not line:
+                break
+            
+            if line.lower() == 'exit' or line.lower() == 'quit':
+                print("Завершение ввода...")
+                break
+            
+            hosts.append(line)
+        except EOFError:
+            break
+        except KeyboardInterrupt:
+            print("\nВвод прерван")
+            break
+    
+    return hosts
+
+
+def save_hosts_to_file(hosts: List[str], filename: str = "hosts.txt"):
+    """
+    Сохранение списка хостов в файл
+    
+    Args:
+        hosts: Список хостов
+        filename: Имя файла для сохранения
+    """
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write("# Список хостов для массового пинга\n")
+            f.write("# Создан: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n\n")
+            for host in hosts:
+                f.write(host + "\n")
+        print(f"\nСписок хостов сохранен в файл: {filename}")
+    except Exception as e:
+        print(f"Ошибка при сохранении файла: {e}")
+
+
+def validate_host(host: str) -> bool:
+    """
+    Базовая валидация имени хоста
+    
+    Args:
+        host: Имя хоста для проверки
+        
+    Returns:
+        bool: True если хост валиден
+    """
+    if not host:
+        return False
+    
+    # Проверяем, не является ли это IP-адресом
+    try:
+        socket.inet_aton(host)
+        return True
+    except socket.error:
+        pass
+    
+    # Проверяем допустимые символы в имени хоста
+    allowed_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_")
+    return all(c in allowed_chars for c in host)
+
+
+def get_hosts_from_user() -> List[str]:
+    """
+    Получение списка хостов от пользователя
+    
+    Returns:
+        List[str]: Список валидных хостов
+    """
+    while True:
+        print("\n" + "="*50)
+        print("МЕНЮ ВЫБОРА ИСТОЧНИКА ХОСТОВ")
+        print("="*50)
+        print("1. Ввести хосты вручную")
+        print("2. Загрузить из файла")
+        print("3. Использовать демонстрационный список")
+        print("4. Выход")
+        print("="*50)
+        
+        choice = input("Выберите вариант (1-4): ").strip()
+        
+        if choice == '1':
+            hosts = read_hosts_from_input()
+            if hosts:
+                # Предлагаем сохранить список
+                save = input("\nСохранить список хостов в файл? (y/n): ").strip().lower()
+                if save == 'y' or save == 'yes':
+                    filename = input("Имя файла (по умолчанию: hosts.txt): ").strip()
+                    if not filename:
+                        filename = "hosts.txt"
+                    save_hosts_to_file(hosts, filename)
+            return hosts
+            
+        elif choice == '2':
+            filename = input("Введите имя файла: ").strip()
+            if not filename:
+                filename = "hosts.txt"
+            
+            hosts = read_hosts_from_file(filename)
+            if hosts:
+                print(f"Загружено {len(hosts)} хостов из файла {filename}")
+                return hosts
+            else:
+                print("Файл пуст или не найден. Попробуйте снова.")
+                
+        elif choice == '3':
+            # Демонстрационный список
+            demo_hosts = [
+                "google.com",
+                "yandex.ru",
+                "github.com",
+                "8.8.8.8",
+                "1.1.1.1",
+                "localhost"
+            ]
+            print("\nИспользуется демонстрационный список хостов:")
+            for host in demo_hosts:
+                print(f"  - {host}")
+            
+            use_demo = input("\nИспользовать этот список? (y/n): ").strip().lower()
+            if use_demo == 'y' or use_demo == 'yes':
+                return demo_hosts
+                
+        elif choice == '4':
+            print("Выход из программы")
+            sys.exit(0)
+        else:
+            print("Неверный выбор. Попробуйте снова.")
+
+
+async def main():
+    """Основная функция утилиты"""
+    parser = argparse.ArgumentParser(
+        description='Утилита для массового пинга хостов',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Примеры использования:
+  python mass_ping.py                        # Интерактивный режим
+  python mass_ping.py -f hosts.txt           # Из файла
+  python mass_ping.py -t 1.0 -c 5            # С параметрами
+  python mass_ping.py --json results.json    # Экспорт в JSON
+  python mass_ping.py --csv output.csv       # Экспорт в CSV
+        """
+    )
+    
+    # Группа источников хостов
+    parser.add_argument('-f', '--file', help='Файл со списком хостов')
+    
+    # Параметры пинга
+    parser.add_argument('-t', '--timeout', type=float, default=2.0, 
+                       help='Таймаут для каждого пинга в секундах (по умолчанию: 2.0)')
+    parser.add_argument('-c', '--count', type=int, default=3,
+                       help='Количество пакетов для каждого хоста (по умолчанию: 3)')
+    parser.add_argument('-l', '--limit', type=int, default=50,
+                       help='Максимальное количество одновременных пингов (по умолчанию: 50)')
+    
+    # Параметры вывода
+    parser.add_argument('--json', help='Экспортировать результаты в JSON файл')
+    parser.add_argument('--csv', help='Экспортировать результаты в CSV файл')
+    parser.add_argument('--summary-only', action='store_true',
+                       help='Выводить только сводную статистику')
+    
+    args = parser.parse_args()
+    
+    # Получаем список хостов
+    if args.file:
+        hosts = read_hosts_from_file(args.file)
+        if not hosts:
+            print(f"Файл {args.file} пуст или не найден. Используйте интерактивный режим.")
+            hosts = get_hosts_from_user()
+    else:
+        # Интерактивный режим
+        hosts = get_hosts_from_user()
+    
+    if not hosts:
+        print("Ошибка: Не указаны хосты для проверки")
+        sys.exit(1)
+    
+    # Валидация хостов
+    valid_hosts = []
+    invalid_hosts = []
+    
+    for host in hosts:
+        if validate_host(host):
+            valid_hosts.append(host)
+        else:
+            invalid_hosts.append(host)
+    
+    if invalid_hosts:
+        print("\nПредупреждение: Некоторые хосты пропущены из-за невалидного формата:")
+        for host in invalid_hosts:
+            print(f"  {host}")
+    
+    if not valid_hosts:
+        print("Ошибка: Нет валидных хостов для проверки")
+        sys.exit(1)
+    
+    print(f"\nНачинаем массовый пинг {len(valid_hosts)} хостов...")
+    print(f"Параметры: таймаут={args.timeout}с, пакетов={args.count}, одновременных={args.limit}")
+    print("="*50)
+    
+    # Создаем и запускаем утилиту
+    try:
+        ping_util = MassPing(
+            timeout=args.timeout,
+            count=args.count,
+            concurrent_limit=args.limit
+        )
+        
+        # Прогресс-бар
+        print("Пинг хостов...")
+        
+        await ping_util.ping_hosts(valid_hosts)
+        
+        # Выводим результаты
+        if not args.summary_only:
+            ping_util.print_detailed_results()
+        
+        ping_util.print_summary()
+        
+        # Экспортируем результаты
+        if args.json:
+            ping_util.export_json(args.json)
+        
+        if args.csv:
+            ping_util.export_csv(args.csv)
+            
+    except KeyboardInterrupt:
+        print("\n\nПинг прерван пользователем")
+        sys.exit(0)
+    except Exception as e:
+        print(f"Критическая ошибка: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nПрограмма завершена")
+    except Exception as e:
+        print(f"Ошибка при запуске программы: {e}")
